@@ -1255,23 +1255,35 @@ benchmarks! {
 	// We assume that every instantiate sends at least the subsistence amount.
 	seal_instantiate {
 		let r in 0 .. API_BENCHMARK_BATCHES;
-		let code = dummy_code::<T>();
-		let hash = code.hash.clone();
-		let hash_bytes = code.hash.encode();
-		let hash_len = hash_bytes.len();
-		Contracts::<T>::put_code_raw(code.code)?;
-		let inputs = (0..r * API_BENCHMARK_BATCH_SIZE).map(|i| i.encode()).collect::<Vec<_>>();
-		let input_len = inputs.get(0).map(|i| i.len()).unwrap_or(0);
-		let input_bytes = inputs.iter().cloned().flatten().collect::<Vec<_>>();
-		let inputs_len = input_bytes.len();
+		let hashes = (0..r * API_BENCHMARK_BATCH_SIZE)
+			.map(|i| {
+				let code = create_code::<T>(ModuleDefinition {
+					call_body: Some(body(vec![
+						Instruction::I32Const(i as i32),
+						Instruction::Drop,
+						Instruction::End,
+					])),
+					.. Default::default()
+				});
+				Contracts::<T>::put_code_raw(code.code)?;
+				Ok(code.hash)
+			})
+			.collect::<Result<Vec<_>, &'static str>>()?;
+		let hash_len = hashes.get(0).map(|x| x.encode().len()).unwrap_or(0);
+		let hashes_bytes = hashes.iter().flat_map(|x| x.encode()).collect::<Vec<_>>();
+		let hashes_len = hashes_bytes.len();
 		let value = Config::<T>::subsistence_threshold_uncached();
 		assert!(value > 0.into());
 		let value_bytes = value.encode();
 		let value_len = value_bytes.len();
 		let addr_len = sp_std::mem::size_of::<T::AccountId>();
-		let hash_offset = value_len;
-		let input_offset = hash_offset + hash_len;
-		let addr_len_offset = input_offset + inputs_len;
+
+		// offsets where to place static data in contract memory
+		let value_offset = 0;
+		let hashes_offset = value_offset + value_len;
+		let addr_len_offset = hashes_offset + hashes_len;
+		let addr_offset = addr_len_offset + addr_len;
+
 		use CountedInstruction::{Counter, Regular};
 		let code = create_code::<T>(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
@@ -1294,16 +1306,12 @@ benchmarks! {
 			}],
 			data_segments: vec![
 				DataSegment {
-					offset: 0,
+					offset: value_offset as u32,
 					value: value_bytes,
 				},
 				DataSegment {
-					offset: hash_offset as u32,
-					value: hash_bytes,
-				},
-				DataSegment {
-					offset: input_offset as u32,
-					value: input_bytes,
+					offset: hashes_offset as u32,
+					value: hashes_bytes,
 				},
 				DataSegment {
 					offset: addr_len_offset as u32,
@@ -1311,14 +1319,14 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body_counted(r * API_BENCHMARK_BATCH_SIZE, vec![
-				Regular(Instruction::I32Const(hash_offset as i32)), // code_hash_ptr
+				Counter(hashes_offset as u32, hash_len as u32), // code_hash_ptr
 				Regular(Instruction::I32Const(hash_len as i32)), // code_hash_len
 				Regular(Instruction::I64Const(0)), // gas
-				Regular(Instruction::I32Const(0)), // value_ptr
+				Regular(Instruction::I32Const(value_offset as i32)), // value_ptr
 				Regular(Instruction::I32Const(value_len as i32)), // value_len
-				Counter(input_offset as u32, input_len as u32), // input_data_ptr
-				Regular(Instruction::I32Const(input_len as i32)), // input_data_len
-				Regular(Instruction::I32Const((addr_len_offset + addr_len) as i32)), // address_ptr
+				Regular(Instruction::I32Const(0)), // input_data_ptr
+				Regular(Instruction::I32Const(0)), // input_data_len
+				Regular(Instruction::I32Const(addr_offset as i32)), // address_ptr
 				Regular(Instruction::I32Const(addr_len_offset as i32)), // address_len_ptr
 				Regular(Instruction::I32Const(u32::max_value() as i32)), // output_ptr
 				Regular(Instruction::I32Const(0)), // output_len_ptr
@@ -1329,10 +1337,10 @@ benchmarks! {
 		});
 		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
-		let addresses = inputs
+		let addresses = hashes
 			.iter()
-			.map(|input| T::DetermineContractAddress::contract_address_for(
-				&hash, input, &instance.account_id
+			.map(|hash| T::DetermineContractAddress::contract_address_for(
+				hash, &[], &instance.account_id
 			))
 			.collect::<Vec<_>>();
 
