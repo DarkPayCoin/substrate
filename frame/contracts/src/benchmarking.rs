@@ -21,6 +21,7 @@
 
 use crate::*;
 use crate::Module as Contracts;
+use crate::exec::StorageKey;
 
 use frame_benchmarking::{benchmarks, account};
 use frame_system::{Module as System, RawOrigin};
@@ -47,6 +48,12 @@ struct Contract<T: Trait> {
 	account_id: T::AccountId,
 	addr: <T::Lookup as StaticLookup>::Source,
 	endowment: BalanceOf<T>,
+	code_hash: <T::Hashing as Hash>::Output,
+}
+
+struct Tombstone<T: Trait> {
+	contract: Contract<T>,
+	storage: Vec<(StorageKey, Vec<u8>)>,
 }
 
 struct ModuleDefinition {
@@ -269,8 +276,8 @@ enum Endow {
 	CollectRent,
 }
 
-fn instantiate_contract_from_index<T: Trait>(
-	account_index: u32,
+fn instantiate_contract_from_account<T: Trait>(
+	caller: T::AccountId,
 	module: WasmModule<T>,
 	data: Vec<u8>,
 	endowment: Endow,
@@ -292,10 +299,9 @@ fn instantiate_contract_from_index<T: Trait>(
 
 			(storage_size, endowment)
 		},
-		Endow::Max => (0.into(), max_endowment::<T>())
+		Endow::Max => (0.into(), max_endowment::<T>()),
 	};
-
-	let caller = create_funded_user::<T>("instantiator", account_index);
+	T::Currency::make_free_balance_be(&caller, funding::<T>());
 	let addr = T::DetermineContractAddress::contract_address_for(&module.hash, &data, &caller);
 	init_block_number::<T>();
 	Contracts::<T>::put_code_raw(module.code)?;
@@ -314,7 +320,17 @@ fn instantiate_contract_from_index<T: Trait>(
 		account_id: addr.clone(),
 		addr: T::Lookup::unlookup(addr),
 		endowment,
+		code_hash: module.hash.clone(),
 	})
+}
+
+fn instantiate_contract_from_index<T: Trait>(
+	index: u32,
+	module: WasmModule<T>,
+	data: Vec<u8>,
+	endowment: Endow,
+) -> Result<Contract<T>, &'static str> {
+	instantiate_contract_from_account(account("instantiator", index, 0), module, data, endowment)
 }
 
 fn instantiate_contract<T: Trait>(
@@ -323,6 +339,46 @@ fn instantiate_contract<T: Trait>(
 	endowment: Endow,
 ) -> Result<Contract<T>, &'static str> {
 	instantiate_contract_from_index(0, module, data, endowment)
+}
+
+fn store_items<T: Trait>(
+	account: &T::AccountId,
+	items: &Vec<(StorageKey, Vec<u8>)>
+) -> Result<(), &'static str> {
+	let info = get_alive::<T>(account)?;
+	for item in items {
+		crate::storage::write_contract_storage::<T>(
+			account,
+			&info.trie_id,
+			&item.0,
+			Some(item.1.clone()),
+		)
+		.map_err(|_| "Failed to write storage to restoration dest")?;
+	}
+	Ok(())
+}
+
+fn create_tombstone<T: Trait>(stor_num: u32, stor_size: u32) -> Result<Tombstone<T>, &'static str> {
+	let contract = instantiate_contract::<T>(dummy_code(), vec![], Endow::CollectRent)?;
+	let storage_items = (0..stor_num).map(|i| {
+		let hash = T::Hashing::hash_of(&i)
+			.as_ref()
+			.try_into()
+			.map_err(|_| "Hash too big for storage key")?;
+		Ok((hash, vec![42u8; stor_size as usize]))
+	}).collect::<Result<Vec<_>, &'static str>>()?;
+
+	store_items::<T>(&contract.account_id, &storage_items)?;
+	System::<T>::set_block_number(
+		eviction_at::<T>(&contract.account_id)? + T::SignedClaimHandicap::get() + 5.into()
+	);
+	crate::rent::collect_rent::<T>(&contract.account_id);
+	ensure_tombstone::<T>(&contract.account_id)?;
+
+	Ok(Tombstone {
+		contract,
+		storage: storage_items,
+	})
 }
 
 fn get_alive<T: Trait>(addr: &T::AccountId) -> Result<AliveContractInfo<T>, &'static str> {
@@ -467,7 +523,9 @@ benchmarks! {
 		ensure_alive::<T>(&instance.account_id)?;
 
 		// generate enough rent so that the contract is evicted
-		System::<T>::set_block_number(eviction_at::<T>(&instance.account_id)? + 5.into());
+		System::<T>::set_block_number(
+			eviction_at::<T>(&instance.account_id)? + T::SignedClaimHandicap::get() + 5.into()
+		);
 	}: _(origin, account_id, None)
 	verify {
 		// the claim surcharge should have evicted the contract
@@ -738,6 +796,73 @@ benchmarks! {
 		}
 	}
 
+	seal_restore_to {
+		let r in 0 .. 1;
+		let tombstone = create_tombstone::<T>(0, 0)?;
+
+		let dest = tombstone.contract.account_id.encode();
+		let dest_len = dest.len();
+		let code_hash = tombstone.contract.code_hash.encode();
+		let code_hash_len = code_hash.len();
+		let rent_allowance = BalanceOf::<T>::max_value().encode();
+		let rent_allowance_len = rent_allowance.len();
+
+		let dest_offset = 0;
+		let code_hash_offset = dest_offset + dest_len;
+		let rent_allowance_offset = code_hash_offset + code_hash_len;
+
+		let code = create_code::<T>(ModuleDefinition {
+			memory: Some(ImportedMemory::max::<T>()),
+			imported_functions: vec![ImportedFunction {
+				name: "seal_restore_to",
+				params: vec![
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+				],
+				return_type: None,
+			}],
+			data_segments: vec![
+				DataSegment {
+					offset: dest_offset as u32,
+					value: dest,
+				},
+				DataSegment {
+					offset: code_hash_offset as u32,
+					value: code_hash,
+				},
+				DataSegment {
+					offset: rent_allowance_offset as u32,
+					value: rent_allowance,
+				},
+			],
+			call_body: Some(body_repeated(r, &[
+				Instruction::I32Const(dest_offset as i32),
+				Instruction::I32Const(dest_len as i32),
+				Instruction::I32Const(code_hash_offset as i32),
+				Instruction::I32Const(code_hash_len as i32),
+				Instruction::I32Const(rent_allowance_offset as i32),
+				Instruction::I32Const(rent_allowance_len as i32),
+				Instruction::I32Const(0), // delta_ptr
+				Instruction::I32Const(0), // delta_count
+				Instruction::Call(0),
+			])),
+			.. Default::default()
+		});
+
+		let instance = instantiate_contract_from_account::<T>(
+			account("origin", 0, 0), code, vec![], Endow::Max
+		)?;
+		store_items::<T>(&instance.account_id, &tombstone.storage)?;
+
+		let origin = RawOrigin::Signed(instance.caller.clone());
+	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
+
 	// We benchmark only for the maximum subject length. We assume that this is some lowish
 	// number (< 1 KB). Therefore we are not overcharging too much in case a smaller subject is
 	// used.
@@ -971,6 +1096,7 @@ benchmarks! {
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
+	// We make sure that all storage accesses are to unique keys.
 	seal_get_storage {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let keys = (0 .. r * API_BENCHMARK_BATCH_SIZE)
@@ -1059,6 +1185,7 @@ benchmarks! {
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
+	// We transfer to unique accounts.
 	seal_transfer {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let accounts = (0..r * API_BENCHMARK_BATCH_SIZE)
@@ -1110,6 +1237,7 @@ benchmarks! {
 		}
 	}
 
+	// We call unique accounts.
 	seal_call {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let dummy_code = dummy_code::<T>();
@@ -1583,6 +1711,7 @@ mod tests {
 	create_test!(seal_return);
 	create_test!(seal_return_per_kb);
 	create_test!(seal_terminate);
+	create_test!(seal_restore_to);
 	create_test!(seal_random);
 	create_test!(seal_deposit_event);
 	create_test!(seal_deposit_event_per_topic_and_kb);
@@ -1593,7 +1722,7 @@ mod tests {
 	create_test!(seal_get_storage_per_kb);
 	create_test!(seal_transfer);
 	create_test!(seal_call);
-	create_test!(seal_call_per_transfer_input_output);
+	create_test!(seal_call_per_transfer_input_output_kb);
 	create_test!(seal_clear_storage);
 	create_test!(seal_hash_sha2_256);
 	create_test!(seal_hash_sha2_256_per_kb);
